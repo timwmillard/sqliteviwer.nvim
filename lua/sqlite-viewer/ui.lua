@@ -460,6 +460,21 @@ function M.open(path, buf)
     end,
   })
 
+  -- 'cursorline' is window-local, not buffer-local, so leaving this buffer
+  -- for another one in the same window would otherwise leave it stuck on.
+  api.nvim_create_autocmd("BufLeave", {
+    buffer = buf,
+    callback = function()
+      vim.wo[api.nvim_get_current_win()].cursorline = false
+    end,
+  })
+  api.nvim_create_autocmd("BufEnter", {
+    buffer = buf,
+    callback = function()
+      vim.wo[api.nvim_get_current_win()].cursorline = true
+    end,
+  })
+
   -- Window options and the first table load run via vim.schedule so we never
   -- touch window state from inside the BufReadCmd autocmd.
   vim.schedule(function()
