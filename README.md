@@ -89,7 +89,7 @@ Defaults shown:
 require("sqlite-viewer").setup({
   patterns = { "*.db", "*.sqlite", "*.sqlite3" }, -- files to consider
   page_size = 100,          -- rows fetched per page
-  display_mode = "box",     -- any sqlite3 output mode: box, column, table, markdown, …
+  display_mode = "table",     -- any sqlite3 output mode: box, column, table, markdown, …
   display_modes = { "box", "column", "markdown", "table" }, -- cycled by `toggle_mode`
   include_views = true,     -- list views alongside tables
   sqlite_cmd = "sqlite3",   -- path to the sqlite3 binary
