@@ -3,15 +3,19 @@ local M = {}
 M.defaults = {
   patterns = { "*.db", "*.sqlite", "*.sqlite3" },
   page_size = 100,
-  max_col_width = 40,
+  display_mode = "box", -- any sqlite3 output mode: box, column, table, markdown, …
+  display_modes = { "box", "column", "markdown", "table" }, -- cycled by keymaps.toggle_mode
   include_views = true,
   sqlite_cmd = "sqlite3", -- override to use a different binary path
   keymaps = { -- set any entry to false/"" to disable it
+    table_list = "T", -- popup listing tables/views
     open_table = "<CR>",
     next_page = "]p",
     prev_page = "[p",
     refresh = "r",
     schema = "K",
+    toggle_mode = "m", -- cycle through display_modes
+    help = "g?", -- popup listing these keymaps
     quit = "q",
     query = "S",
     run_query = "<CR>",
@@ -39,6 +43,10 @@ end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+  -- tbl_deep_extend merges lists element-wise; a user list must replace ours
+  if opts and opts.display_modes then
+    M.config.display_modes = vim.deepcopy(opts.display_modes)
+  end
   M.did_setup = true
 
   require("sqlite-viewer.db").setup(M.config)

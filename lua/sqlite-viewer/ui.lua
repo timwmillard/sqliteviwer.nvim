@@ -1,14 +1,14 @@
--- Viewer UI: a narrow table-list pane on the left and a paged results grid
--- on the right (the buffer that BufReadCmd handed us).
+-- Viewer UI: the buffer BufReadCmd hands us *is* the table view, showing
+-- sqlite3's own formatted output. A floating popup (default `T`) lists the
+-- tables; `<CR>` there switches the view.
 
 local api = vim.api
 local db = require("sqlite-viewer.db")
-local render = require("sqlite-viewer.render")
 
 local M = {}
 
 local config = {}
-local states = {} -- grid bufnr -> viewer state
+local states = {} -- viewer bufnr -> state
 local warned_missing_binary = false
 
 function M.setup(cfg)
@@ -57,31 +57,56 @@ local function scratch_opts(buf)
   vim.bo[buf].filetype = "sqliteviewer"
 end
 
-local function render_grid(state)
+-- Open a centered floating scratch window showing `lines`. Returns buf, win.
+local function open_float(lines, title)
+  local width = 1
+  for _, line in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+  width = math.min(math.max(width + 2, 20), vim.o.columns - 4)
+  local height = math.min(math.max(#lines, 1), vim.o.lines - 4)
+
+  local buf = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "sqliteviewer"
+  local win = api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " ",
+    title_pos = "center",
+  })
+  vim.wo[win].wrap = false
+  return buf, win
+end
+
+local function render_view(state)
   local lines
   if not state.current_table then
-    lines = { "No tables in database.", "", "Press `" .. (config.keymaps.quit or "q") .. "` to close." }
+    lines = {
+      "No tables in database.",
+      "",
+      "Press `" .. (config.keymaps.quit or "q") .. "` to close.",
+    }
   else
     local first = state.total_rows == 0 and 0 or state.offset + 1
-    local last = math.min(state.offset + #state.rows, state.total_rows)
+    local last = math.min(state.offset + config.page_size, state.total_rows)
     lines = {
       string.format("%s — rows %d–%d of %d", state.current_table, first, last, state.total_rows),
       "",
     }
-    vim.list_extend(lines, render.grid(state.columns, state.rows, { max_col_width = config.max_col_width }))
+    vim.list_extend(lines, state.view_lines)
     if state.total_rows == 0 then
       lines[#lines + 1] = "(no rows)"
     end
   end
-  set_lines(state.grid_buf, lines)
-end
-
-local function render_sidebar(state)
-  local lines = state.tables
-  if #lines == 0 then
-    lines = { "(no tables)" }
-  end
-  set_lines(state.side_buf, lines)
+  set_lines(state.buf, lines)
 end
 
 local function load_table(state, name, offset)
@@ -117,12 +142,10 @@ local function load_table(state, name, offset)
   end
 
   state.current_table = name
-  state.schema = info.data
-  state.columns = columns
   state.total_rows = total
   state.offset = offset
-  state.rows = rows.data
-  render_grid(state)
+  state.view_lines = rows.data
+  render_view(state)
 end
 
 local function page(state, direction)
@@ -146,32 +169,74 @@ local function refresh(state)
     return
   end
   state.tables = tables.data
-  render_sidebar(state)
   if state.current_table and vim.tbl_contains(state.tables, state.current_table) then
     load_table(state, state.current_table, state.offset)
   elseif state.tables[1] then
     load_table(state, state.tables[1], 0)
   else
     state.current_table = nil
-    render_grid(state)
+    render_view(state)
   end
 end
 
 local function close(state)
-  -- Tear the side windows down first: doing it from inside the grid buffer's
-  -- BufWipeout autocmd can abort the buffer deletion when one of them is the
-  -- current window.
-  states[state.grid_buf] = nil
-  close_win(state.side_win)
+  states[state.buf] = nil
+  close_win(state.list_win)
   close_win(state.query_win)
-  delete_buf(state.side_buf)
+  delete_buf(state.list_buf)
   delete_buf(state.query_buf)
-  delete_buf(state.grid_buf)
+  delete_buf(state.buf)
 end
 
--- Execute the query buffer's contents against the database. Results render
--- into the grid pane; statements that return no rows (writes, DDL) refresh
--- the whole viewer so their effect is visible immediately.
+-- Floating table list. Pressing the shortcut again (or q/<Esc>, or leaving
+-- the window) closes it; <CR> opens the table under the cursor.
+local function open_table_list(state)
+  if state.list_win and api.nvim_win_is_valid(state.list_win) then
+    api.nvim_win_close(state.list_win, true)
+    return
+  end
+  local names = state.tables
+  local lines = #names > 0 and names or { "(no tables)" }
+  local buf, win = open_float(lines, "Tables")
+  state.list_buf, state.list_win = buf, win
+  vim.wo[win].cursorline = true
+
+  for i, name in ipairs(names) do
+    if name == state.current_table then
+      api.nvim_win_set_cursor(win, { i, 0 })
+      break
+    end
+  end
+
+  local function close_list()
+    if api.nvim_win_is_valid(win) then
+      pcall(api.nvim_win_close, win, true)
+    end
+  end
+
+  map(buf, config.keymaps.open_table, function()
+    local name = names[api.nvim_win_get_cursor(win)[1]]
+    close_list()
+    if name then
+      load_table(state, name, 0)
+    end
+  end, "open table under cursor")
+  for _, lhs in ipairs({ config.keymaps.table_list, config.keymaps.quit, "<Esc>" }) do
+    map(buf, lhs, close_list, "close table list")
+  end
+
+  api.nvim_create_autocmd("WinLeave", {
+    buffer = buf,
+    once = true,
+    callback = function()
+      vim.schedule(close_list)
+    end,
+  })
+end
+
+-- Execute the query buffer's contents against the database. Raw sqlite3
+-- output renders into the main view; statements that return no rows (writes,
+-- DDL) refresh the viewer so their effect is visible immediately.
 local function run_query(state)
   if not (state.query_buf and api.nvim_buf_is_valid(state.query_buf)) then
     return
@@ -180,9 +245,9 @@ local function run_query(state)
   if vim.trim(sql) == "" then
     return
   end
-  local res = db.exec(state.path, sql)
+  local res = db.raw(state.path, sql, { readonly = false })
   if not res.ok then
-    set_lines(state.grid_buf, vim.split("SQL error:\n\n" .. (res.err or "unknown error"), "\n"))
+    set_lines(state.buf, vim.split("SQL error:\n\n" .. (res.err or "unknown error"), "\n"))
     return
   end
   if #res.data == 0 then
@@ -190,33 +255,25 @@ local function run_query(state)
     notify("statement executed — no rows returned")
     return
   end
-  local shown = {}
-  for i = 1, math.min(#res.data, config.page_size) do
-    shown[i] = res.data[i]
-  end
-  local title = string.format("query — %d rows", #res.data)
-  if #shown < #res.data then
-    title = title .. string.format(" (showing first %d)", #shown)
-  end
-  local lines = { title, "" }
-  vim.list_extend(lines, render.grid(res.columns, shown, { max_col_width = config.max_col_width }))
-  set_lines(state.grid_buf, lines)
+  local lines = { "query results", "" }
+  vim.list_extend(lines, res.data)
+  set_lines(state.buf, lines)
 end
 
--- Open (or focus) the SQL query pane below the grid. The buffer survives the
+-- Open (or focus) the SQL query pane below the view. The buffer survives the
 -- pane being closed, so query text persists while the viewer is open.
 local function open_query(state)
   if state.query_win and api.nvim_win_is_valid(state.query_win) then
     api.nvim_set_current_win(state.query_win)
     return
   end
-  local grid_win = api.nvim_win_is_valid(state.grid_win) and state.grid_win
-    or vim.fn.win_findbuf(state.grid_buf)[1]
-  if not grid_win then
+  local win = api.nvim_win_is_valid(state.win) and state.win
+    or vim.fn.win_findbuf(state.buf)[1]
+  if not win then
     return
   end
-  state.grid_win = grid_win
-  api.nvim_set_current_win(grid_win)
+  state.win = win
+  api.nvim_set_current_win(win)
   vim.cmd("belowright 8split")
   state.query_win = api.nvim_get_current_win()
 
@@ -239,40 +296,75 @@ local function open_query(state)
   vim.wo[state.query_win].winfixheight = true
 end
 
-local function show_schema(state)
-  if not state.schema or not state.current_table then
+-- Cycle config.display_modes and re-render the current view. The mode change
+-- is global (db reads the same config table), so it sticks for new queries.
+local function toggle_mode(state)
+  local modes = config.display_modes or { "box", "column" }
+  if #modes == 0 then
     return
   end
-  local lines = render.grid(
-    { "cid", "name", "type", "notnull", "dflt_value", "pk" },
-    state.schema,
-    { max_col_width = config.max_col_width }
-  )
-  table.insert(lines, 1, "")
-  table.insert(lines, 1, "Schema: " .. state.current_table)
-
-  local width = 1
-  for _, line in ipairs(lines) do
-    width = math.max(width, vim.fn.strdisplaywidth(line))
+  local idx = 1
+  for i, mode in ipairs(modes) do
+    if mode == config.display_mode then
+      idx = i
+      break
+    end
   end
-  width = math.min(width, vim.o.columns - 4)
-  local height = math.min(#lines, vim.o.lines - 4)
+  config.display_mode = modes[idx % #modes + 1]
+  notify("display mode: " .. config.display_mode)
+  if state.current_table then
+    load_table(state, state.current_table, state.offset)
+  end
+end
 
-  local buf = api.nvim_create_buf(false, true)
-  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].filetype = "sqliteviewer"
-  local win = api.nvim_open_win(buf, true, {
-    relative = "editor",
-    row = math.floor((vim.o.lines - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "rounded",
-  })
-  vim.wo[win].wrap = false
+local function show_help()
+  local keys = config.keymaps
+  local entries = {
+    { keys.table_list, "toggle the table list popup" },
+    { keys.open_table, "open table under cursor (table list popup)" },
+    { keys.next_page, "next page of rows" },
+    { keys.prev_page, "previous page of rows" },
+    { keys.refresh, "refresh table list and current table" },
+    { keys.schema, "show schema for the current table" },
+    { keys.toggle_mode, "cycle sqlite3 display mode" },
+    { keys.query, "open the SQL query pane" },
+    { keys.run_query, "run the query (in the query pane)" },
+    { keys.help, "show this help" },
+    { keys.quit, "close viewer / popup / query pane" },
+  }
+  local key_width = 0
+  for _, entry in ipairs(entries) do
+    if entry[1] and entry[1] ~= "" then
+      key_width = math.max(key_width, vim.fn.strdisplaywidth(entry[1]))
+    end
+  end
+  local lines = {}
+  for _, entry in ipairs(entries) do
+    local lhs = entry[1]
+    if lhs and lhs ~= "" then
+      lines[#lines + 1] = " " .. lhs .. string.rep(" ", key_width - vim.fn.strdisplaywidth(lhs) + 2) .. entry[2]
+    end
+  end
+  local buf, win = open_float(lines, "Help")
+  for _, lhs in ipairs({ config.keymaps.help, "q", "<Esc>" }) do
+    map(buf, lhs, function()
+      if api.nvim_win_is_valid(win) then
+        api.nvim_win_close(win, true)
+      end
+    end, "close help")
+  end
+end
+
+local function show_schema(state)
+  if not state.current_table then
+    return
+  end
+  local res = db.raw(state.path, "PRAGMA table_info(" .. db.quote_ident(state.current_table) .. ");")
+  if not res.ok then
+    notify(res.err, vim.log.levels.ERROR)
+    return
+  end
+  local buf, win = open_float(res.data, "Schema: " .. state.current_table)
   for _, lhs in ipairs({ "q", "<Esc>" }) do
     vim.keymap.set("n", lhs, function()
       if api.nvim_win_is_valid(win) then
@@ -282,95 +374,11 @@ local function show_schema(state)
   end
 end
 
--- Build the sidebar window/buffer and wire up keymaps. Runs via vim.schedule
--- so we never split windows from inside the BufReadCmd autocmd.
-local function build_windows(state)
-  local grid_win = state.grid_win
-  if not (api.nvim_win_is_valid(grid_win) and api.nvim_buf_is_valid(state.grid_buf)) then
-    return
-  end
-
-  api.nvim_set_current_win(grid_win)
-  vim.wo[grid_win].wrap = false
-  vim.wo[grid_win].cursorline = true
-
-  vim.cmd("leftabove 25vsplit")
-  local side_win = api.nvim_get_current_win()
-  local side_buf = api.nvim_create_buf(false, true)
-  api.nvim_win_set_buf(side_win, side_buf)
-  scratch_opts(side_buf)
-  pcall(api.nvim_buf_set_name, side_buf, "sqlite-viewer://tables")
-  state.side_win = side_win
-  state.side_buf = side_buf
-
-  vim.wo[side_win].number = false
-  vim.wo[side_win].relativenumber = false
-  vim.wo[side_win].signcolumn = "no"
-  vim.wo[side_win].winfixwidth = true
-  vim.wo[side_win].cursorline = true
-  vim.wo[side_win].wrap = false
-
-  local keys = config.keymaps
-
-  map(side_buf, keys.open_table, function()
-    local row = api.nvim_win_get_cursor(side_win)[1]
-    local name = state.tables[row]
-    if name then
-      load_table(state, name, 0)
-    end
-  end, "open table under cursor")
-
-  for _, buf in ipairs({ side_buf, state.grid_buf }) do
-    map(buf, keys.refresh, function()
-      refresh(state)
-    end, "refresh")
-    map(buf, keys.schema, function()
-      show_schema(state)
-    end, "show schema")
-    map(buf, keys.quit, function()
-      close(state)
-    end, "close viewer")
-    map(buf, keys.query, function()
-      open_query(state)
-    end, "open SQL query pane")
-  end
-
-  map(state.grid_buf, keys.next_page, function()
-    page(state, 1)
-  end, "next page")
-  map(state.grid_buf, keys.prev_page, function()
-    page(state, -1)
-  end, "previous page")
-
-  api.nvim_create_autocmd("BufWipeout", {
-    buffer = state.grid_buf,
-    once = true,
-    callback = function()
-      states[state.grid_buf] = nil
-      close_win(state.side_win)
-      close_win(state.query_win)
-      delete_buf(state.side_buf)
-      delete_buf(state.query_buf)
-    end,
-  })
-
-  render_sidebar(state)
-  if state.tables[1] then
-    load_table(state, state.tables[1], 0)
-  else
-    render_grid(state)
-  end
-
-  -- start with the cursor on the table list
-  api.nvim_set_current_win(side_win)
-  api.nvim_win_set_cursor(side_win, { 1, 0 })
-end
-
---- Take over `grid_buf` (the buffer BufReadCmd gave us) as a viewer for `path`.
+--- Take over `buf` (the buffer BufReadCmd gave us) as a viewer for `path`.
 ---@param path string
----@param grid_buf integer
-function M.open(path, grid_buf)
-  local existing = states[grid_buf]
+---@param buf integer
+function M.open(path, buf)
+  local existing = states[buf]
   if existing then
     -- :edit on an already-open viewer -> just refresh it
     refresh(existing)
@@ -385,46 +393,96 @@ function M.open(path, grid_buf)
         vim.log.levels.ERROR
       )
     end
-    scratch_opts(grid_buf)
-    set_lines(grid_buf, { "sqlite-viewer: `" .. config.sqlite_cmd .. "` not found in PATH." })
+    scratch_opts(buf)
+    set_lines(buf, { "sqlite-viewer: `" .. config.sqlite_cmd .. "` not found in PATH." })
     return
   end
 
   local tables = db.list_tables(path, config.include_views)
   if not tables.ok then
     notify("failed to read " .. path .. ": " .. (tables.err or "unknown error"), vim.log.levels.ERROR)
-    scratch_opts(grid_buf)
-    set_lines(grid_buf, { "sqlite-viewer: failed to read database.", "", tables.err or "" })
+    scratch_opts(buf)
+    set_lines(buf, { "sqlite-viewer: failed to read database.", "", tables.err or "" })
     return
   end
 
-  scratch_opts(grid_buf)
-  set_lines(grid_buf, { "Loading " .. path .. " …" })
+  scratch_opts(buf)
+  set_lines(buf, { "Loading " .. path .. " …" })
 
   local state = {
     path = path,
-    grid_buf = grid_buf,
-    grid_win = api.nvim_get_current_win(),
+    buf = buf,
+    win = api.nvim_get_current_win(),
     tables = tables.data,
     current_table = nil,
-    columns = {},
-    rows = {},
     offset = 0,
     total_rows = 0,
-    schema = nil,
+    view_lines = {},
   }
-  states[grid_buf] = state
+  states[buf] = state
 
+  local keys = config.keymaps
+  map(buf, keys.table_list, function()
+    open_table_list(state)
+  end, "table list")
+  map(buf, keys.refresh, function()
+    refresh(state)
+  end, "refresh")
+  map(buf, keys.schema, function()
+    show_schema(state)
+  end, "show schema")
+  map(buf, keys.toggle_mode, function()
+    toggle_mode(state)
+  end, "cycle display mode")
+  map(buf, keys.help, show_help, "show keymap help")
+  map(buf, keys.quit, function()
+    close(state)
+  end, "close viewer")
+  map(buf, keys.query, function()
+    open_query(state)
+  end, "open SQL query pane")
+  map(buf, keys.next_page, function()
+    page(state, 1)
+  end, "next page")
+  map(buf, keys.prev_page, function()
+    page(state, -1)
+  end, "previous page")
+
+  api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    once = true,
+    callback = function()
+      states[buf] = nil
+      close_win(state.list_win)
+      close_win(state.query_win)
+      delete_buf(state.list_buf)
+      delete_buf(state.query_buf)
+    end,
+  })
+
+  -- Window options and the first table load run via vim.schedule so we never
+  -- touch window state from inside the BufReadCmd autocmd.
   vim.schedule(function()
-    if states[grid_buf] == state then
-      build_windows(state)
+    if states[buf] ~= state then
+      return
+    end
+    local win = vim.fn.win_findbuf(buf)[1]
+    if win then
+      state.win = win
+      vim.wo[win].wrap = false
+      vim.wo[win].cursorline = true
+    end
+    if state.tables[1] then
+      load_table(state, state.tables[1], 0)
+    else
+      render_view(state)
     end
   end)
 end
 
 -- Exposed for testing.
-function M._get_state(grid_buf)
-  return states[grid_buf]
+function M._get_state(buf)
+  return states[buf]
 end
 
 return M

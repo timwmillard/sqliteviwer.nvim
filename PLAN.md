@@ -3,6 +3,34 @@
 A Neovim plugin that detects when a SQLite file is opened and replaces the buffer
 with an interactive, read-only table viewer.
 
+> **Status:** v1 shipped, then superseded by the v2 refactor below. The v1
+> sections are kept for history; where they conflict, v2 wins.
+
+## v2 refactor (2026-07)
+
+- **No sidebar.** The buffer BufReadCmd hands us is the whole UI: a single
+  table view. The table list moved into a floating popup toggled with `T`
+  (`keymaps.table_list`); `<CR>` in the popup opens the table under the cursor.
+- **Raw sqlite3 rendering.** The view shows sqlite3's own formatted stdout
+  (`display_mode` config, default `box`) verbatim. `render.lua` is deleted.
+  `-json` survives only for metadata the plugin needs as values: table names,
+  row counts, and column names (used to summarize BLOBs in SQL).
+
+### Stage two (planned): oil.nvim-style editing
+
+Like oil.nvim edits the filesystem, the table view becomes an editable buffer:
+change cell text, delete/add row lines, then `:w` diffs the buffer against the
+loaded page and applies the changes as UPDATE/INSERT/DELETE statements.
+Open questions to resolve when we get there:
+
+- Raw display output is lossy (truncation, NULL vs empty string, BLOBs), so
+  editing likely needs a stricter display mode (e.g. `--quote`) or a parallel
+  JSON fetch of the visible page to diff against.
+- Row identity for UPDATE/DELETE: use `rowid` (fetch it with the page); WITHOUT
+  ROWID tables need the primary key columns instead.
+- Concurrent writes: re-check the page (or use a change counter) before
+  applying, and refuse with a clear message if the underlying data moved.
+
 ## Scope (v1)
 
 **In scope**

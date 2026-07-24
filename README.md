@@ -5,7 +5,10 @@ instead of a screen of binary garbage.
 
 - Detects SQLite files by their 16-byte magic header — not just the extension,
   so non-SQLite `.db` files still open normally.
-- Two-pane UI: a table list on the left, a paged results grid on the right.
+- Single-buffer UI: the buffer *is* the table view. Press `T` for a floating
+  popup listing tables/views and `<CR>` to switch.
+- Rows render as sqlite3's own output (`box` mode by default) — what you see
+  is exactly what the CLI prints.
 - Browse tables and views, page through rows, inspect schemas in a float.
   Browsing is strictly read-only.
 - A SQL query pane (`S`) for running arbitrary statements, including writes.
@@ -48,35 +51,35 @@ SQLite database, the viewer opens; otherwise the file loads as a normal buffer.
 
 ### Keymaps (buffer-local, inside the viewer)
 
-| Key    | Action                                          |
-| ------ | ----------------------------------------------- |
-| `<CR>` | Open the table under the cursor (table list)    |
-| `]p`   | Next page of rows                               |
-| `[p`   | Previous page of rows                           |
-| `r`    | Refresh table list and current table            |
-| `K`    | Show the current table's schema in a float      |
-| `S`    | Open the SQL query pane                         |
-| `q`    | Close the viewer                                |
+| Key    | Action                                             |
+| ------ | -------------------------------------------------- |
+| `T`    | Toggle the floating table list                     |
+| `<CR>` | Open the table under the cursor (in the popup)     |
+| `]p`   | Next page of rows                                  |
+| `[p`   | Previous page of rows                              |
+| `r`    | Refresh table list and current table               |
+| `K`    | Show the current table's schema in a float         |
+| `m`    | Cycle the sqlite3 display mode (`display_modes`)   |
+| `S`    | Open the SQL query pane                            |
+| `g?`   | Show a help popup listing these keymaps            |
+| `q`    | Close the viewer (or the popup, when it's focused) |
 
 All of these are configurable (see below). `gg`/`G` and normal movement work as
 usual within the current page.
 
 ## SQL query pane
 
-Press `S` in the viewer to open an editable SQL buffer below the grid
+Press `S` in the viewer to open an editable SQL buffer below the view
 (`filetype=sql`, so your usual SQL highlighting applies). Type a statement and
 press `<CR>` in normal mode to execute it against the open database:
 
-- SELECTs render into the grid pane (`query — N rows`); results are capped at
-  `page_size` rows for display.
+- Result-returning statements render sqlite3's raw output into the main view.
 - **Write statements (INSERT/UPDATE/DELETE/DDL) execute for real** — the query
   pane is not read-only. After a write the viewer refreshes so the change is
   visible immediately. There is no undo; be deliberate.
-- Errors render into the grid pane. `r` restores the current table view.
+- Errors render into the main view. `r` restores the current table view.
 - `q` in the query pane closes just the pane; your query text is kept and `S`
   reopens it.
-- One result-returning statement per run (multiple writes in one run are fine,
-  e.g. a small seed script).
 
 ## Configuration
 
@@ -86,15 +89,19 @@ Defaults shown:
 require("sqlite-viewer").setup({
   patterns = { "*.db", "*.sqlite", "*.sqlite3" }, -- files to consider
   page_size = 100,          -- rows fetched per page
-  max_col_width = 40,       -- cells wider than this are truncated with …
+  display_mode = "box",     -- any sqlite3 output mode: box, column, table, markdown, …
+  display_modes = { "box", "column", "markdown", "table" }, -- cycled by `toggle_mode`
   include_views = true,     -- list views alongside tables
   sqlite_cmd = "sqlite3",   -- path to the sqlite3 binary
   keymaps = {               -- set any entry to false/"" to disable it
+    table_list = "T",   -- toggle the floating table list
     open_table = "<CR>",
     next_page = "]p",
     prev_page = "[p",
     refresh = "r",
     schema = "K",
+    toggle_mode = "m",  -- cycle through display_modes
+    help = "g?",        -- help popup listing the keymaps
     quit = "q",
     query = "S",      -- open the SQL query pane
     run_query = "<CR>", -- execute the query buffer (normal mode)
@@ -107,18 +114,21 @@ highlights or extra keymaps via a `FileType` autocmd.
 
 ## Rendering notes
 
-- `NULL` cells render as `NULL`.
-- BLOB cells render as `<BLOB n bytes>` — raw bytes are never dumped.
-- Embedded newlines are collapsed to `↵` so every row stays on one line.
+- The view is sqlite3's raw output in `display_mode` — the plugin does no
+  formatting of its own. `box` mode needs sqlite3 3.33+ (2020); use
+  `display_mode = "column"` on older binaries.
+- BLOB cells in table pages render as `<BLOB n bytes>` — raw bytes are never
+  dumped.
 - Row fetches are always bounded by `LIMIT`/`OFFSET`; large tables are paged,
   never loaded whole.
 
 ## Known limitations
 
-- Browsing is read-only (`sqlite3 -readonly`); no in-grid cell editing. The
-  SQL query pane is the only write path.
-- Query-pane results are not paged — only the first `page_size` rows display.
-- No filtering, sorting, or search in the grid yet.
+- Browsing is read-only (`sqlite3 -readonly`); no in-buffer cell editing yet.
+  The SQL query pane is the only write path.
+- Query-pane results are not paged — an unbounded SELECT renders everything
+  it returns; add your own `LIMIT` on big tables.
+- No filtering, sorting, or search in the view yet.
 - Queries run synchronously; they are fast because fetches are bounded by
   `page_size`, but a huge table's `count(*)` or an expensive query can
   briefly block.
