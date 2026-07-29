@@ -13,9 +13,12 @@ instead of a screen of binary garbage.
   Browsing is strictly read-only.
 - A SQL query pane (`S`) for running arbitrary statements, including writes.
 - `gd` on a foreign key cell jumps to the referenced table and lands the
-  cursor on the referenced row; `<C-o>`/`<C-i>` step back and forward through
-  those jumps (the buffer is reused for every table, so the regular jumplist
-  can't do this on its own).
+  cursor on the referenced row — works on query results too, as long as the
+  query reads from a single table (no joins/subqueries). `<C-o>`/`<C-i>` step
+  back and forward through those jumps, including back into the query pane's
+  last results (a snapshot of what was rendered, not a live re-run — it won't
+  repeat a write statement's side effects). The regular jumplist can't do
+  this on its own since the buffer is reused for every table/query view.
 - No dependencies beyond the `sqlite3` CLI. No FFI, no build step.
 
 ## Requirements

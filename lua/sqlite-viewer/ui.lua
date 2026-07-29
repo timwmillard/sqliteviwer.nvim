@@ -153,7 +153,6 @@ local function load_table(state, name, offset)
   state.total_rows = total
   state.offset = offset
   state.view_lines = rows.data
-  state.columns = columns
   state.view_mode = "table"
   render_view(state)
 end
@@ -244,6 +243,25 @@ local function open_table_list(state)
   })
 end
 
+-- Best-effort source table for a query result, used to resolve foreign keys
+-- on `gd`. Only handles the common case of a single-table SELECT — bails
+-- (returns nil) on joins or multiple FROMs (subqueries), where there's no
+-- reliable single table to attribute a column to.
+local function infer_single_table(sql)
+  local lower = sql:lower()
+  if lower:find("join") then
+    return nil
+  end
+  local from_count = 0
+  for _ in lower:gmatch("from") do
+    from_count = from_count + 1
+  end
+  if from_count ~= 1 then
+    return nil
+  end
+  return sql:match("[Ff][Rr][Oo][Mm]%s+[\"'`%[]?([%w_]+)")
+end
+
 -- Execute the query buffer's contents against the database. Raw sqlite3
 -- output renders into the main view; statements that return no rows (writes,
 -- DDL) refresh the viewer so their effect is visible immediately.
@@ -258,6 +276,8 @@ local function run_query(state)
   local res = db.raw(state.path, sql, { readonly = false })
   if not res.ok then
     state.view_mode = "query"
+    state.query_table = nil
+    state.view_lines = {}
     set_lines(state.buf, vim.split("SQL error:\n\n" .. (res.err or "unknown error"), "\n"))
     return
   end
@@ -267,6 +287,8 @@ local function run_query(state)
     return
   end
   state.view_mode = "query"
+  state.query_table = infer_single_table(sql)
+  state.view_lines = res.data
   local lines = { "query results", "" }
   vim.list_extend(lines, res.data)
   set_lines(state.buf, lines)
@@ -426,10 +448,27 @@ local function parse_column_ranges(sep_line)
   return ranges
 end
 
+-- The table whose foreign keys apply to the current view: the loaded table
+-- itself in table mode, or a best-effort inferred single source table for
+-- query results (nil if it can't be determined — see infer_single_table).
+local function source_table(state)
+  if state.view_mode == "table" then
+    return state.current_table
+  elseif state.view_mode == "query" then
+    return state.query_table
+  end
+  return nil
+end
+
 -- Resolve the SQL column name and cell text under the cursor, or nil if it
--- isn't over a data cell (header/border line, query results, empty view).
+-- isn't over a data cell (header/border line, an unresolvable query, an
+-- unrecognized display mode, empty view, …). Column names are read straight
+-- off the rendered header line — sqlite3 emits the same name there whether
+-- it came from `PRAGMA table_info` or a query's own column/alias — so this
+-- works identically for the table view and query results.
 local function cell_at_cursor(state)
-  if state.view_mode ~= "table" or not state.current_table then
+  local table_name = source_table(state)
+  if not table_name then
     return nil
   end
   local layout = MODE_LAYOUT[config.display_mode]
@@ -446,22 +485,38 @@ local function cell_at_cursor(state)
   if view_idx < layout.data_start or view_idx > data_end then
     return nil
   end
+  local header_line = state.view_lines[layout.header]
   local sep_line = state.view_lines[layout.sep]
   local line = state.view_lines[view_idx]
-  if not (sep_line and line) then
+  if not (header_line and sep_line and line) then
     return nil
   end
   local char_col = vim.fn.charidx(line, cursor[2])
-  for i, r in ipairs(parse_column_ranges(sep_line)) do
+  for _, r in ipairs(parse_column_ranges(sep_line)) do
     if char_col >= r[1] and char_col < r[2] then
-      local col_name = state.columns and state.columns[i]
-      if not col_name then
+      local col_name = vim.trim(vim.fn.strcharpart(header_line, r[1], r[2] - r[1]))
+      if col_name == "" then
         return nil
       end
-      return { column = col_name, value = vim.trim(vim.fn.strcharpart(line, r[1], r[2] - r[1])) }
+      return {
+        table = table_name,
+        column = col_name,
+        value = vim.trim(vim.fn.strcharpart(line, r[1], r[2] - r[1])),
+      }
     end
   end
   return nil
+end
+
+-- Snapshot of wherever the cursor currently is, for the nav_back/nav_forward
+-- stacks: a table+offset in table mode (re-fetched on restore), or the
+-- already-rendered lines in query mode (replayed verbatim on restore, since
+-- re-running the SQL could repeat a write statement's side effects).
+local function current_location_entry(state, cursor)
+  if state.view_mode == "query" then
+    return { kind = "query", lines = vim.deepcopy(state.view_lines), query_table = state.query_table, cursor = cursor }
+  end
+  return { kind = "table", table = state.current_table, offset = state.offset, cursor = cursor }
 end
 
 -- `gd` on a foreign-key cell: jump to the referenced table and land the
@@ -476,7 +531,7 @@ local function goto_foreign_key(state)
     return
   end
 
-  local fks = db.foreign_key_list(state.path, state.current_table)
+  local fks = db.foreign_key_list(state.path, cell.table)
   if not fks.ok then
     notify(fks.err, vim.log.levels.ERROR)
     return
@@ -522,7 +577,7 @@ local function goto_foreign_key(state)
 
   local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
   local from_cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
-  table.insert(state.nav_back, { table = state.current_table, offset = state.offset, cursor = from_cursor })
+  table.insert(state.nav_back, current_location_entry(state, from_cursor))
   state.nav_forward = {}
 
   load_table(state, fk.table, page_offset)
@@ -533,9 +588,21 @@ local function goto_foreign_key(state)
   end
 end
 
--- Restore a table+offset+cursor location captured by goto_foreign_key.
+-- Restore a location captured by current_location_entry: either a table+
+-- offset (re-fetched via load_table) or a query-results snapshot. The query
+-- case replays the *rendered lines*, not the SQL — re-running the statement
+-- on every back/forward step would repeat any writes it made.
 local function restore_location(state, entry)
-  load_table(state, entry.table, entry.offset)
+  if entry.kind == "query" then
+    state.view_mode = "query"
+    state.query_table = entry.query_table
+    state.view_lines = entry.lines
+    local lines = { "query results", "" }
+    vim.list_extend(lines, entry.lines)
+    set_lines(state.buf, lines)
+  else
+    load_table(state, entry.table, entry.offset)
+  end
   local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
   if win then
     local last_line = api.nvim_buf_line_count(state.buf)
@@ -554,7 +621,7 @@ local function nav_back(state)
   end
   local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
   local cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
-  table.insert(state.nav_forward, { table = state.current_table, offset = state.offset, cursor = cursor })
+  table.insert(state.nav_forward, current_location_entry(state, cursor))
   restore_location(state, entry)
 end
 
@@ -566,7 +633,7 @@ local function nav_forward(state)
   end
   local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
   local cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
-  table.insert(state.nav_back, { table = state.current_table, offset = state.offset, cursor = cursor })
+  table.insert(state.nav_back, current_location_entry(state, cursor))
   restore_location(state, entry)
 end
 
