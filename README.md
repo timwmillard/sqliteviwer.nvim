@@ -5,7 +5,7 @@ instead of a screen of binary garbage.
 
 - Detects SQLite files by their 16-byte magic header — not just the extension,
   so non-SQLite `.db` files still open normally.
-- Single-buffer UI: the buffer *is* the table view. Press `T` for a floating
+- Single-buffer UI: the buffer *is* the table view. Press `L` for a floating
   popup listing tables/views and `<CR>` to switch.
 - Rows render as sqlite3's own output (`box` mode by default) — what you see
   is exactly what the CLI prints.
@@ -53,7 +53,7 @@ SQLite database, the viewer opens; otherwise the file loads as a normal buffer.
 
 | Key    | Action                                             |
 | ------ | -------------------------------------------------- |
-| `T`    | Toggle the floating table list                     |
+| `L`    | Toggle the floating table list                     |
 | `<CR>` | Open the table under the cursor (in the popup)     |
 | `]p`   | Next page of rows                                  |
 | `[p`   | Previous page of rows                              |
@@ -94,7 +94,7 @@ require("sqlite-viewer").setup({
   include_views = true,     -- list views alongside tables
   sqlite_cmd = "sqlite3",   -- path to the sqlite3 binary
   keymaps = {               -- set any entry to false/"" to disable it
-    table_list = "T",   -- toggle the floating table list
+    table_list = "L",   -- toggle the floating table list
     open_table = "<CR>",
     next_page = "]p",
     prev_page = "[p",

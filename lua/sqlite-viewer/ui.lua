@@ -1,5 +1,5 @@
 -- Viewer UI: the buffer BufReadCmd hands us *is* the table view, showing
--- sqlite3's own formatted output. A floating popup (default `T`) lists the
+-- sqlite3's own formatted output. A floating popup (default `L`) lists the
 -- tables; `<CR>` there switches the view.
 
 local api = vim.api
@@ -89,11 +89,19 @@ end
 local function render_view(state)
   local lines
   if not state.current_table then
-    lines = {
-      "No tables in database.",
-      "",
-      "Press `" .. (config.keymaps.quit or "q") .. "` to close.",
-    }
+    if #state.tables == 0 then
+      lines = {
+        "No tables in database.",
+        "",
+        "Press `" .. (config.keymaps.quit or "q") .. "` to close.",
+      }
+    else
+      lines = {
+        "Select a table to view.",
+        "",
+        "Press `" .. (config.keymaps.table_list or "L") .. "` to list tables.",
+      }
+    end
   else
     local first = state.total_rows == 0 and 0 or state.offset + 1
     local last = math.min(state.offset + config.page_size, state.total_rows)
@@ -475,8 +483,8 @@ function M.open(path, buf)
     end,
   })
 
-  -- Window options and the first table load run via vim.schedule so we never
-  -- touch window state from inside the BufReadCmd autocmd.
+  -- Window options and the initial table-list popup run via vim.schedule so
+  -- we never touch window state from inside the BufReadCmd autocmd.
   vim.schedule(function()
     if states[buf] ~= state then
       return
@@ -487,10 +495,9 @@ function M.open(path, buf)
       vim.wo[win].wrap = false
       vim.wo[win].cursorline = true
     end
+    render_view(state)
     if state.tables[1] then
-      load_table(state, state.tables[1], 0)
-    else
-      render_view(state)
+      open_table_list(state)
     end
   end)
 end
