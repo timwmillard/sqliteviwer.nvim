@@ -340,6 +340,8 @@ local function show_help()
     { keys.schema, "show schema for the current table" },
     { keys.toggle_mode, "cycle sqlite3 display mode" },
     { keys.goto_fk, "go to related row (foreign key under cursor)" },
+    { keys.nav_back, "back to previous table/row (before gd)" },
+    { keys.nav_forward, "forward after nav_back" },
     { keys.query, "open the SQL query pane" },
     { keys.run_query, "run the query (in the query pane)" },
     { keys.help, "show this help" },
@@ -517,13 +519,55 @@ local function goto_foreign_key(state)
 
   local page_offset = math.floor(offset_res.data / config.page_size) * config.page_size
   local row_in_page = offset_res.data - page_offset
+
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  local from_cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
+  table.insert(state.nav_back, { table = state.current_table, offset = state.offset, cursor = from_cursor })
+  state.nav_forward = {}
+
   load_table(state, fk.table, page_offset)
 
   local layout = MODE_LAYOUT[config.display_mode]
-  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
   if win and layout then
     pcall(api.nvim_win_set_cursor, win, { layout.data_start + row_in_page + 2, 0 })
   end
+end
+
+-- Restore a table+offset+cursor location captured by goto_foreign_key.
+local function restore_location(state, entry)
+  load_table(state, entry.table, entry.offset)
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  if win then
+    local last_line = api.nvim_buf_line_count(state.buf)
+    pcall(api.nvim_win_set_cursor, win, { math.min(entry.cursor[1], last_line), entry.cursor[2] })
+  end
+end
+
+-- `gd` jumps push the departure point onto nav_back; these two step through
+-- that history the same way a tag/jump stack would, which the buffer-local
+-- <C-o>/<C-i> mapping can't do here since every table reuses the same buffer.
+local function nav_back(state)
+  local entry = table.remove(state.nav_back)
+  if not entry then
+    notify("no earlier location")
+    return
+  end
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  local cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
+  table.insert(state.nav_forward, { table = state.current_table, offset = state.offset, cursor = cursor })
+  restore_location(state, entry)
+end
+
+local function nav_forward(state)
+  local entry = table.remove(state.nav_forward)
+  if not entry then
+    notify("no later location")
+    return
+  end
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  local cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
+  table.insert(state.nav_back, { table = state.current_table, offset = state.offset, cursor = cursor })
+  restore_location(state, entry)
 end
 
 --- Take over `buf` (the buffer BufReadCmd gave us) as a viewer for `path`.
@@ -570,6 +614,8 @@ function M.open(path, buf)
     offset = 0,
     total_rows = 0,
     view_lines = {},
+    nav_back = {},
+    nav_forward = {},
   }
   states[buf] = state
 
@@ -589,6 +635,12 @@ function M.open(path, buf)
   map(buf, keys.goto_fk, function()
     goto_foreign_key(state)
   end, "go to related row (foreign key)")
+  map(buf, keys.nav_back, function()
+    nav_back(state)
+  end, "back to previous table/row (before gd)")
+  map(buf, keys.nav_forward, function()
+    nav_forward(state)
+  end, "forward after nav_back")
   map(buf, keys.help, show_help, "show keymap help")
   map(buf, keys.quit, function()
     close(state)

@@ -13,7 +13,9 @@ instead of a screen of binary garbage.
   Browsing is strictly read-only.
 - A SQL query pane (`S`) for running arbitrary statements, including writes.
 - `gd` on a foreign key cell jumps to the referenced table and lands the
-  cursor on the referenced row.
+  cursor on the referenced row; `<C-o>`/`<C-i>` step back and forward through
+  those jumps (the buffer is reused for every table, so the regular jumplist
+  can't do this on its own).
 - No dependencies beyond the `sqlite3` CLI. No FFI, no build step.
 
 ## Requirements
@@ -63,6 +65,8 @@ SQLite database, the viewer opens; otherwise the file loads as a normal buffer.
 | `K`    | Show the current table's schema in a float         |
 | `m`    | Cycle the sqlite3 display mode (`display_modes`)   |
 | `gd`   | Go to the related row for a foreign key cell       |
+| `<C-o>`| Back to the table/row before the last `gd` jump    |
+| `<C-i>`| Forward again after `<C-o>`                        |
 | `S`    | Open the SQL query pane                            |
 | `g?`   | Show a help popup listing these keymaps            |
 | `q`    | Close the viewer (or the popup, when it's focused) |
@@ -105,6 +109,8 @@ require("sqlite-viewer").setup({
     schema = "K",
     toggle_mode = "m",  -- cycle through display_modes
     goto_fk = "gd",     -- jump to the related row for a foreign key cell
+    nav_back = "<C-o>", -- back to the table/row before the last gd jump
+    nav_forward = "<C-i>", -- forward again after nav_back
     help = "g?",        -- help popup listing the keymaps
     quit = "q",
     query = "S",      -- open the SQL query pane
