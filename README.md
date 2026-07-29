@@ -12,6 +12,8 @@ instead of a screen of binary garbage.
 - Browse tables and views, page through rows, inspect schemas in a float.
   Browsing is strictly read-only.
 - A SQL query pane (`S`) for running arbitrary statements, including writes.
+- `gd` on a foreign key cell jumps to the referenced table and lands the
+  cursor on the referenced row.
 - No dependencies beyond the `sqlite3` CLI. No FFI, no build step.
 
 ## Requirements
@@ -60,6 +62,7 @@ SQLite database, the viewer opens; otherwise the file loads as a normal buffer.
 | `r`    | Refresh table list and current table               |
 | `K`    | Show the current table's schema in a float         |
 | `m`    | Cycle the sqlite3 display mode (`display_modes`)   |
+| `gd`   | Go to the related row for a foreign key cell       |
 | `S`    | Open the SQL query pane                            |
 | `g?`   | Show a help popup listing these keymaps            |
 | `q`    | Close the viewer (or the popup, when it's focused) |
@@ -101,6 +104,7 @@ require("sqlite-viewer").setup({
     refresh = "r",
     schema = "K",
     toggle_mode = "m",  -- cycle through display_modes
+    goto_fk = "gd",     -- jump to the related row for a foreign key cell
     help = "g?",        -- help popup listing the keymaps
     quit = "q",
     query = "S",      -- open the SQL query pane

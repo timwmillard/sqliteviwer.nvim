@@ -140,6 +140,69 @@ function M.row_count(path, table_name)
   return { ok = true, data = res.data[1] and res.data[1].n or 0 }
 end
 
+--- Quote a SQL string literal for safe interpolation into a query.
+---@param value string
+---@return string
+function M.quote_value(value)
+  return "'" .. tostring(value):gsub("'", "''") .. "'"
+end
+
+--- Foreign key metadata for a table (PRAGMA foreign_key_list). Each entry:
+--- { id, seq, table, from, to, on_update, on_delete, match }. `to` is nil
+--- when the reference relies on the referenced table's primary key.
+---@param path string
+---@param table_name string
+function M.foreign_key_list(path, table_name)
+  return query(path, "PRAGMA foreign_key_list(" .. M.quote_ident(table_name) .. ");")
+end
+
+--- Name of `table_name`'s single-column primary key, or nil if it has none
+--- or a composite one.
+---@param path string
+---@param table_name string
+function M.primary_key_column(path, table_name)
+  local info = M.table_info(path, table_name)
+  if not info.ok then
+    return info
+  end
+  local pk_col
+  for _, col in ipairs(info.data) do
+    if col.pk and col.pk > 0 then
+      if pk_col then
+        return { ok = true, data = nil } -- composite key, not supported
+      end
+      pk_col = col.name
+    end
+  end
+  return { ok = true, data = pk_col }
+end
+
+--- 0-based position of the row where `column` = `value`, in the table's
+--- natural rowid order — the same order `rows()` relies on for paging.
+--- `data` is nil when no row matches.
+---@param path string
+---@param table_name string
+---@param column string
+---@param value string
+function M.find_row_offset(path, table_name, column, value)
+  local t = M.quote_ident(table_name)
+  local c = M.quote_ident(column)
+  local v = M.quote_value(value)
+  local rowid_res = query(path, "SELECT rowid AS r FROM " .. t .. " WHERE " .. c .. " = " .. v .. " LIMIT 1;")
+  if not rowid_res.ok then
+    return rowid_res
+  end
+  local row = rowid_res.data[1]
+  if not row then
+    return { ok = true, data = nil }
+  end
+  local count_res = query(path, "SELECT count(*) AS n FROM " .. t .. " WHERE rowid < " .. tostring(row.r) .. ";")
+  if not count_res.ok then
+    return count_res
+  end
+  return { ok = true, data = count_res.data[1] and count_res.data[1].n or 0 }
+end
+
 --- Fetch a page of rows as raw display lines. When `columns` is given (from
 --- table_info), BLOB cells are summarized in SQL as '<BLOB n bytes>' so raw
 --- bytes never land in the buffer.

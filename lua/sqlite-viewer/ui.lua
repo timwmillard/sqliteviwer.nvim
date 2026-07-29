@@ -153,6 +153,8 @@ local function load_table(state, name, offset)
   state.total_rows = total
   state.offset = offset
   state.view_lines = rows.data
+  state.columns = columns
+  state.view_mode = "table"
   render_view(state)
 end
 
@@ -255,6 +257,7 @@ local function run_query(state)
   end
   local res = db.raw(state.path, sql, { readonly = false })
   if not res.ok then
+    state.view_mode = "query"
     set_lines(state.buf, vim.split("SQL error:\n\n" .. (res.err or "unknown error"), "\n"))
     return
   end
@@ -263,6 +266,7 @@ local function run_query(state)
     notify("statement executed — no rows returned")
     return
   end
+  state.view_mode = "query"
   local lines = { "query results", "" }
   vim.list_extend(lines, res.data)
   set_lines(state.buf, lines)
@@ -335,6 +339,7 @@ local function show_help()
     { keys.refresh, "refresh table list and current table" },
     { keys.schema, "show schema for the current table" },
     { keys.toggle_mode, "cycle sqlite3 display mode" },
+    { keys.goto_fk, "go to related row (foreign key under cursor)" },
     { keys.query, "open the SQL query pane" },
     { keys.run_query, "run the query (in the query pane)" },
     { keys.help, "show this help" },
@@ -379,6 +384,145 @@ local function show_schema(state)
         api.nvim_win_close(win, true)
       end
     end, { buffer = buf, nowait = true, silent = true })
+  end
+end
+
+-- Line layout of each display mode's rendered output, as 1-based indices
+-- into state.view_lines: `header`/`sep` are the header and separator/border
+-- line, `data_start` is the first data row, and `trailing_border` says
+-- whether the last line is a closing border (box/table) rather than data.
+local MODE_LAYOUT = {
+  box = { header = 2, sep = 3, data_start = 4, trailing_border = true },
+  table = { header = 2, sep = 3, data_start = 4, trailing_border = true },
+  column = { header = 1, sep = 2, data_start = 3, trailing_border = false },
+  markdown = { header = 1, sep = 2, data_start = 3, trailing_border = false },
+}
+
+local function is_dash(ch)
+  return ch == "-" or ch == "─"
+end
+
+-- Column boundaries (0-based char indices, half-open) read off a separator
+-- line, e.g. "├────┼───────┼───────────┤" or "--  -----  ---------". Header
+-- text may be centered (box/table right-align numeric headers) but the
+-- separator's dash runs always line up with the data cells beneath them.
+local function parse_column_ranges(sep_line)
+  local ranges = {}
+  local n = vim.fn.strchars(sep_line)
+  local start
+  for i = 0, n - 1 do
+    if is_dash(vim.fn.strcharpart(sep_line, i, 1)) then
+      start = start or i
+    elseif start then
+      ranges[#ranges + 1] = { start, i }
+      start = nil
+    end
+  end
+  if start then
+    ranges[#ranges + 1] = { start, n }
+  end
+  return ranges
+end
+
+-- Resolve the SQL column name and cell text under the cursor, or nil if it
+-- isn't over a data cell (header/border line, query results, empty view).
+local function cell_at_cursor(state)
+  if state.view_mode ~= "table" or not state.current_table then
+    return nil
+  end
+  local layout = MODE_LAYOUT[config.display_mode]
+  if not layout then
+    return nil
+  end
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  if not win then
+    return nil
+  end
+  local cursor = api.nvim_win_get_cursor(win)
+  local view_idx = cursor[1] - 2 -- title + blank line precede view_lines in the buffer
+  local data_end = #state.view_lines - (layout.trailing_border and 1 or 0)
+  if view_idx < layout.data_start or view_idx > data_end then
+    return nil
+  end
+  local sep_line = state.view_lines[layout.sep]
+  local line = state.view_lines[view_idx]
+  if not (sep_line and line) then
+    return nil
+  end
+  local char_col = vim.fn.charidx(line, cursor[2])
+  for i, r in ipairs(parse_column_ranges(sep_line)) do
+    if char_col >= r[1] and char_col < r[2] then
+      local col_name = state.columns and state.columns[i]
+      if not col_name then
+        return nil
+      end
+      return { column = col_name, value = vim.trim(vim.fn.strcharpart(line, r[1], r[2] - r[1])) }
+    end
+  end
+  return nil
+end
+
+-- `gd` on a foreign-key cell: jump to the referenced table and land the
+-- cursor on the referenced row.
+local function goto_foreign_key(state)
+  local cell = cell_at_cursor(state)
+  if not cell then
+    return
+  end
+  if cell.value == "" then
+    notify("NULL — nothing to follow")
+    return
+  end
+
+  local fks = db.foreign_key_list(state.path, state.current_table)
+  if not fks.ok then
+    notify(fks.err, vim.log.levels.ERROR)
+    return
+  end
+  local fk
+  for _, entry in ipairs(fks.data) do
+    if entry.from == cell.column then
+      fk = entry
+      break
+    end
+  end
+  if not fk then
+    notify(("`%s` is not a foreign key"):format(cell.column))
+    return
+  end
+
+  local to_col = fk.to
+  if not to_col or to_col == "" then
+    local pk = db.primary_key_column(state.path, fk.table)
+    if not pk.ok then
+      notify(pk.err, vim.log.levels.ERROR)
+      return
+    end
+    if not pk.data then
+      notify(("could not determine primary key of `%s`"):format(fk.table), vim.log.levels.ERROR)
+      return
+    end
+    to_col = pk.data
+  end
+
+  local offset_res = db.find_row_offset(state.path, fk.table, to_col, cell.value)
+  if not offset_res.ok then
+    notify(offset_res.err, vim.log.levels.ERROR)
+    return
+  end
+  if not offset_res.data then
+    notify(("no row in `%s` where %s = %s"):format(fk.table, to_col, cell.value))
+    return
+  end
+
+  local page_offset = math.floor(offset_res.data / config.page_size) * config.page_size
+  local row_in_page = offset_res.data - page_offset
+  load_table(state, fk.table, page_offset)
+
+  local layout = MODE_LAYOUT[config.display_mode]
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  if win and layout then
+    pcall(api.nvim_win_set_cursor, win, { layout.data_start + row_in_page + 2, 0 })
   end
 end
 
@@ -442,6 +586,9 @@ function M.open(path, buf)
   map(buf, keys.toggle_mode, function()
     toggle_mode(state)
   end, "cycle display mode")
+  map(buf, keys.goto_fk, function()
+    goto_foreign_key(state)
+  end, "go to related row (foreign key)")
   map(buf, keys.help, show_help, "show keymap help")
   map(buf, keys.quit, function()
     close(state)

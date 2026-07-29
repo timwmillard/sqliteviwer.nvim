@@ -15,6 +15,7 @@ M.defaults = {
     refresh = "r",
     schema = "K",
     toggle_mode = "m", -- cycle through display_modes
+    goto_fk = "gd", -- jump to the related row for a foreign key cell
     help = "g?", -- popup listing these keymaps
     quit = "q",
     query = "S",
