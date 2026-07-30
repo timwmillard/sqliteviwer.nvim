@@ -13,10 +13,13 @@ instead of a screen of binary garbage.
   Browsing is strictly read-only.
 - A SQL query pane (`S`) for running arbitrary statements, including writes.
 - `gd` on a foreign key cell jumps to the referenced table and lands the
-  cursor on the referenced row — works on query results too, as long as the
-  query reads from a single table (no joins/subqueries). `<C-o>`/`<C-i>` step
-  back and forward through those jumps, including back into the query pane's
-  last results (a snapshot of what was rendered, not a live re-run — it won't
+  cursor on the referenced row. `gd` on any other cell — its table's primary
+  key or otherwise — instead offers every table that has a foreign key
+  pointing at it, and filters your pick down to just the rows that reference
+  this one. Both directions work on query results too, as long as the query
+  reads from a single table (no joins/subqueries). `<C-o>`/`<C-i>` step back
+  and forward through those jumps, including back into the query pane's last
+  results (a snapshot of what was rendered, not a live re-run — it won't
   repeat a write statement's side effects). The regular jumplist can't do
   this on its own since the buffer is reused for every table/query view.
 - No dependencies beyond the `sqlite3` CLI. No FFI, no build step.
@@ -67,7 +70,7 @@ SQLite database, the viewer opens; otherwise the file loads as a normal buffer.
 | `r`    | Refresh table list and current table               |
 | `K`    | Show the current table's schema in a float         |
 | `m`    | Cycle the sqlite3 display mode (`display_modes`)   |
-| `gd`   | Go to the related row for a foreign key cell       |
+| `gd`   | On a foreign key: go to the related row. On any other cell: pick a table that references it and filter to matching rows |
 | `<C-o>`| Back to the table/row before the last `gd` jump    |
 | `<C-i>`| Forward again after `<C-o>`                        |
 | `S`    | Open the SQL query pane                            |

@@ -262,17 +262,10 @@ local function infer_single_table(sql)
   return sql:match("[Ff][Rr][Oo][Mm]%s+[\"'`%[]?([%w_]+)")
 end
 
--- Execute the query buffer's contents against the database. Raw sqlite3
--- output renders into the main view; statements that return no rows (writes,
--- DDL) refresh the viewer so their effect is visible immediately.
-local function run_query(state)
-  if not (state.query_buf and api.nvim_buf_is_valid(state.query_buf)) then
-    return
-  end
-  local sql = table.concat(api.nvim_buf_get_lines(state.query_buf, 0, -1, false), "\n")
-  if vim.trim(sql) == "" then
-    return
-  end
+-- Execute SQL against the database and render the result into the main
+-- view. Raw sqlite3 output renders verbatim; statements that return no rows
+-- (writes, DDL) refresh the viewer so their effect is visible immediately.
+local function execute_and_render_query(state, sql)
   local res = db.raw(state.path, sql, { readonly = false })
   if not res.ok then
     state.view_mode = "query"
@@ -294,6 +287,41 @@ local function run_query(state)
   set_lines(state.buf, lines)
 end
 
+-- Run whatever's currently in the query buffer.
+local function run_query(state)
+  if not (state.query_buf and api.nvim_buf_is_valid(state.query_buf)) then
+    return
+  end
+  local sql = table.concat(api.nvim_buf_get_lines(state.query_buf, 0, -1, false), "\n")
+  if vim.trim(sql) == "" then
+    return
+  end
+  execute_and_render_query(state, sql)
+end
+
+-- Create the query buffer (without opening its window) if it doesn't exist
+-- yet, so query text set programmatically — e.g. a reverse foreign-key
+-- filter — is visible if the user opens the pane afterwards with `S`.
+local function ensure_query_buf(state)
+  if state.query_buf and api.nvim_buf_is_valid(state.query_buf) then
+    return state.query_buf
+  end
+  local buf = api.nvim_create_buf(false, true)
+  state.query_buf = buf
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "sql"
+  pcall(api.nvim_buf_set_name, buf, "sqlite-viewer://query")
+  map(buf, config.keymaps.run_query, function()
+    run_query(state)
+  end, "run query")
+  map(buf, config.keymaps.quit, function()
+    if state.query_win and api.nvim_win_is_valid(state.query_win) then
+      api.nvim_win_close(state.query_win, true)
+    end
+  end, "close query pane")
+  return buf
+end
+
 -- Open (or focus) the SQL query pane below the view. The buffer survives the
 -- pane being closed, so query text persists while the viewer is open.
 local function open_query(state)
@@ -310,22 +338,7 @@ local function open_query(state)
   api.nvim_set_current_win(win)
   vim.cmd("belowright 8split")
   state.query_win = api.nvim_get_current_win()
-
-  if not (state.query_buf and api.nvim_buf_is_valid(state.query_buf)) then
-    local buf = api.nvim_create_buf(false, true)
-    state.query_buf = buf
-    vim.bo[buf].swapfile = false
-    vim.bo[buf].filetype = "sql"
-    pcall(api.nvim_buf_set_name, buf, "sqlite-viewer://query")
-    map(buf, config.keymaps.run_query, function()
-      run_query(state)
-    end, "run query")
-    map(buf, config.keymaps.quit, function()
-      if state.query_win and api.nvim_win_is_valid(state.query_win) then
-        api.nvim_win_close(state.query_win, true)
-      end
-    end, "close query pane")
-  end
+  ensure_query_buf(state)
   api.nvim_win_set_buf(state.query_win, state.query_buf)
   vim.wo[state.query_win].winfixheight = true
 end
@@ -361,7 +374,7 @@ local function show_help()
     { keys.refresh, "refresh table list and current table" },
     { keys.schema, "show schema for the current table" },
     { keys.toggle_mode, "cycle sqlite3 display mode" },
-    { keys.goto_fk, "go to related row (foreign key under cursor)" },
+    { keys.goto_fk, "foreign key: go to related row; other cell: pick a table referencing it" },
     { keys.nav_back, "back to previous table/row (before gd)" },
     { keys.nav_forward, "forward after nav_back" },
     { keys.query, "open the SQL query pane" },
@@ -519,8 +532,75 @@ local function current_location_entry(state, cursor)
   return { kind = "table", table = state.current_table, offset = state.offset, cursor = cursor }
 end
 
+-- Capture where the cursor is now (before navigating away) and push it onto
+-- nav_back; shared by the forward FK jump and the reverse child-table
+-- filter below.
+local function push_departure(state, win)
+  local from_cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
+  table.insert(state.nav_back, current_location_entry(state, from_cursor))
+  state.nav_forward = {}
+end
+
+-- Filter `child_table` down to the rows whose `from_col` matches `value` —
+-- the reverse of the forward FK jump: "show me what points at this row".
+-- Runs through the same query-results path as the SQL pane, and seeds the
+-- query buffer with the filter so `S` afterwards shows (and lets you
+-- refine) the exact statement used.
+local function filter_child_table(state, child_table, from_col, value)
+  local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
+  push_departure(state, win)
+
+  local sql = string.format(
+    "SELECT * FROM %s WHERE %s = %s;",
+    db.quote_ident(child_table),
+    db.quote_ident(from_col),
+    db.quote_value(value)
+  )
+  local buf = ensure_query_buf(state)
+  api.nvim_buf_set_lines(buf, 0, -1, false, { sql })
+  execute_and_render_query(state, sql)
+end
+
+-- Popup listing tables that reference the cursor's cell via a foreign key —
+-- the reverse direction of goto_foreign_key. Picking one filters it down to
+-- the rows that point at this value.
+local function open_child_picker(state, candidates, value)
+  local lines = {}
+  for _, c in ipairs(candidates) do
+    lines[#lines + 1] = ("%s  (%s)"):format(c.table, c.column)
+  end
+  local buf, win = open_float(lines, "Referenced by")
+  vim.wo[win].cursorline = true
+
+  local function close()
+    if api.nvim_win_is_valid(win) then
+      pcall(api.nvim_win_close, win, true)
+    end
+  end
+
+  map(buf, config.keymaps.open_table, function()
+    local choice = candidates[api.nvim_win_get_cursor(win)[1]]
+    close()
+    if choice then
+      filter_child_table(state, choice.table, choice.column, value)
+    end
+  end, "filter this table by the selected relationship")
+  for _, lhs in ipairs({ config.keymaps.quit, "<Esc>" }) do
+    map(buf, lhs, close, "close")
+  end
+  api.nvim_create_autocmd("WinLeave", {
+    buffer = buf,
+    once = true,
+    callback = function()
+      vim.schedule(close)
+    end,
+  })
+end
+
 -- `gd` on a foreign-key cell: jump to the referenced table and land the
--- cursor on the referenced row.
+-- cursor on the referenced row. `gd` on any other cell that other tables
+-- reference (a primary key or otherwise) instead offers those tables,
+-- filtered down to the rows pointing at this one.
 local function goto_foreign_key(state)
   local cell = cell_at_cursor(state)
   if not cell then
@@ -544,7 +624,16 @@ local function goto_foreign_key(state)
     end
   end
   if not fk then
-    notify(("`%s` is not a foreign key"):format(cell.column))
+    local children = db.child_tables(state.path, cell.table, cell.column)
+    if not children.ok then
+      notify(children.err, vim.log.levels.ERROR)
+      return
+    end
+    if #children.data == 0 then
+      notify(("`%s` is not a foreign key and nothing references it"):format(cell.column))
+      return
+    end
+    open_child_picker(state, children.data, cell.value)
     return
   end
 
@@ -576,9 +665,7 @@ local function goto_foreign_key(state)
   local row_in_page = offset_res.data - page_offset
 
   local win = (state.win and api.nvim_win_is_valid(state.win)) and state.win or vim.fn.win_findbuf(state.buf)[1]
-  local from_cursor = win and api.nvim_win_get_cursor(win) or { 1, 0 }
-  table.insert(state.nav_back, current_location_entry(state, from_cursor))
-  state.nav_forward = {}
+  push_departure(state, win)
 
   load_table(state, fk.table, page_offset)
 

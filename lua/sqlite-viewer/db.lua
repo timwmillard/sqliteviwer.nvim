@@ -177,6 +177,55 @@ function M.primary_key_column(path, table_name)
   return { ok = true, data = pk_col }
 end
 
+--- Every foreign key in the database, one query via the pragma_foreign_key_list
+--- table-valued function rather than one PRAGMA per table. Each entry:
+--- { from_table, to_table, from_col, to_col }. `to_col` is nil when the
+--- reference relies on the referenced table's primary key.
+---@param path string
+function M.all_foreign_keys(path)
+  return query(
+    path,
+    'SELECT m.name AS from_table, fk."table" AS to_table, fk."from" AS from_col, fk."to" AS to_col '
+      .. "FROM sqlite_master m, pragma_foreign_key_list(m.name) fk WHERE m.type = 'table';"
+  )
+end
+
+--- Tables (and the column) that hold a foreign key pointing at
+--- `table_name`.`column_name` — the reverse of foreign_key_list. Each entry:
+--- { table, column }.
+---@param path string
+---@param table_name string
+---@param column_name string
+function M.child_tables(path, table_name, column_name)
+  local all = M.all_foreign_keys(path)
+  if not all.ok then
+    return all
+  end
+  local pk -- resolved lazily; false once looked up with no result, to avoid re-querying
+  local matches = {}
+  local seen = {}
+  for _, fk in ipairs(all.data) do
+    if fk.to_table == table_name then
+      local to_col = fk.to_col
+      if not to_col or to_col == "" then
+        if pk == nil then
+          local pk_res = M.primary_key_column(path, table_name)
+          pk = (pk_res.ok and pk_res.data) or false
+        end
+        to_col = pk or nil
+      end
+      if to_col == column_name then
+        local key = fk.from_table .. "." .. fk.from_col
+        if not seen[key] then
+          seen[key] = true
+          matches[#matches + 1] = { table = fk.from_table, column = fk.from_col }
+        end
+      end
+    end
+  end
+  return { ok = true, data = matches }
+end
+
 --- 0-based position of the row where `column` = `value`, in the table's
 --- natural rowid order — the same order `rows()` relies on for paging.
 --- `data` is nil when no row matches.
