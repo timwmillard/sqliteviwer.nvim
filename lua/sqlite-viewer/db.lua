@@ -252,6 +252,26 @@ function M.find_row_offset(path, table_name, column, value)
   return { ok = true, data = count_res.data[1] and count_res.data[1].n or 0 }
 end
 
+-- BLOB cells summarized as '<BLOB n bytes>' so raw bytes never land in the
+-- buffer (or get scanned for embedded newlines — see rows_json below).
+local function blob_safe_select_list(columns)
+  if not (columns and #columns > 0) then
+    return "*"
+  end
+  local parts = {}
+  for _, col in ipairs(columns) do
+    local q = M.quote_ident(col)
+    parts[#parts + 1] = string.format(
+      "CASE WHEN typeof(%s) = 'blob' THEN '<BLOB ' || length(%s) || ' bytes>' ELSE %s END AS %s",
+      q,
+      q,
+      q,
+      q
+    )
+  end
+  return table.concat(parts, ", ")
+end
+
 --- Fetch a page of rows as raw display lines. When `columns` is given (from
 --- table_info), BLOB cells are summarized in SQL as '<BLOB n bytes>' so raw
 --- bytes never land in the buffer.
@@ -261,29 +281,45 @@ end
 ---@param limit integer
 ---@param offset integer
 function M.rows(path, table_name, columns, limit, offset)
-  local select_list = "*"
-  if columns and #columns > 0 then
-    local parts = {}
-    for _, col in ipairs(columns) do
-      local q = M.quote_ident(col)
-      parts[#parts + 1] = string.format(
-        "CASE WHEN typeof(%s) = 'blob' THEN '<BLOB ' || length(%s) || ' bytes>' ELSE %s END AS %s",
-        q,
-        q,
-        q,
-        q
-      )
-    end
-    select_list = table.concat(parts, ", ")
-  end
   local sql = string.format(
     "SELECT %s FROM %s LIMIT %d OFFSET %d;",
-    select_list,
+    blob_safe_select_list(columns),
     M.quote_ident(table_name),
     math.floor(limit),
     math.floor(offset)
   )
   return M.raw(path, sql)
+end
+
+--- The same page as `rows`, but as decoded rows (array of column -> value)
+--- instead of display text. A cell containing embedded newlines makes
+--- sqlite3 print that row across multiple physical lines (and, in box/table
+--- mode, adds a border between every row on the page once any row does
+--- this) — this is how the UI works out exactly how many physical lines
+--- each row occupies, so cursor/row mapping stays correct.
+---@param path string
+---@param table_name string
+---@param columns string[]|nil ordered column names
+---@param limit integer
+---@param offset integer
+function M.rows_json(path, table_name, columns, limit, offset)
+  local sql = string.format(
+    "SELECT %s FROM %s LIMIT %d OFFSET %d;",
+    blob_safe_select_list(columns),
+    M.quote_ident(table_name),
+    math.floor(limit),
+    math.floor(offset)
+  )
+  return query(path, sql)
+end
+
+--- Run arbitrary SQL read-only and return decoded JSON rows. Exposes the
+--- module's JSON query path for callers (the query pane) that need
+--- structured data alongside `raw`'s formatted text for the same statement.
+---@param path string
+---@param sql string
+function M.query_json(path, sql)
+  return query(path, sql)
 end
 
 return M

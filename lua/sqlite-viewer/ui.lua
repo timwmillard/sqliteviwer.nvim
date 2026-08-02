@@ -148,11 +148,20 @@ local function load_table(state, name, offset)
     notify(rows.err, vim.log.levels.ERROR)
     return
   end
+  -- Parallel structured fetch of the same page, so cell/row lookups can work
+  -- out exactly how many physical lines a row spans (a cell with embedded
+  -- newlines breaks the "1 line = 1 row" assumption) instead of guessing.
+  local json_rows = db.rows_json(state.path, name, columns, config.page_size, offset)
+  if not json_rows.ok then
+    notify(json_rows.err, vim.log.levels.ERROR)
+    return
+  end
 
   state.current_table = name
   state.total_rows = total
   state.offset = offset
   state.view_lines = rows.data
+  state.page_rows = json_rows.data
   state.view_mode = "table"
   render_view(state)
 end
@@ -262,6 +271,15 @@ local function infer_single_table(sql)
   return sql:match("[Ff][Rr][Oo][Mm]%s+[\"'`%[]?([%w_]+)")
 end
 
+-- Whether re-running `sql` a second time (for a parallel JSON fetch, so cell
+-- lookups can be precise even when a cell wraps across physical lines) is
+-- safe: a plain SELECT has no side effects to repeat, unlike INSERT/UPDATE/
+-- DELETE/DDL. Best-effort, same spirit as infer_single_table.
+local function is_plain_select(sql)
+  local trimmed = vim.trim(sql):lower()
+  return trimmed == "select" or trimmed:sub(1, 7) == "select "
+end
+
 -- Execute SQL against the database and render the result into the main
 -- view. Raw sqlite3 output renders verbatim; statements that return no rows
 -- (writes, DDL) refresh the viewer so their effect is visible immediately.
@@ -271,6 +289,7 @@ local function execute_and_render_query(state, sql)
     state.view_mode = "query"
     state.query_table = nil
     state.view_lines = {}
+    state.page_rows = nil
     set_lines(state.buf, vim.split("SQL error:\n\n" .. (res.err or "unknown error"), "\n"))
     return
   end
@@ -282,6 +301,13 @@ local function execute_and_render_query(state, sql)
   state.view_mode = "query"
   state.query_table = infer_single_table(sql)
   state.view_lines = res.data
+  state.page_rows = nil
+  if is_plain_select(sql) then
+    local json_res = db.query_json(state.path, sql)
+    if json_res.ok then
+      state.page_rows = json_res.data
+    end
+  end
   local lines = { "query results", "" }
   vim.list_extend(lines, res.data)
   set_lines(state.buf, lines)
@@ -473,12 +499,78 @@ local function source_table(state)
   return nil
 end
 
+-- Whether `line` is a border/blank line sqlite3 inserts *between* data rows
+-- once any row in the page needs more than one physical line (a cell with
+-- an embedded newline) — box/table switch to bordering every row, column
+-- mode blanks a line, markdown never separates rows at all. Distinguished
+-- from an ordinary data line by the absence of that mode's cell delimiter,
+-- rather than by character content, since a data line can itself be blank
+-- padding around short values.
+local function is_row_separator(mode, line)
+  if mode == "box" then
+    return not line:find("│", 1, true)
+  elseif mode == "table" then
+    return not line:find("|", 1, true)
+  elseif mode == "column" then
+    return line == ""
+  end
+  return false -- markdown: sqlite3 never inserts anything between rows
+end
+
+-- Map each row of state.page_rows to the [view_start, view_end] range of
+-- view_lines it actually occupies. Usually that's one line each, but a cell
+-- with an embedded newline makes sqlite3 print that row across N physical
+-- lines (N = 1 + the most newlines in any one of its cells) — walking the
+-- page with that count, and skipping is_row_separator lines in between,
+-- keeps row/cursor mapping correct instead of assuming 1 line per row.
+-- Returns nil when there's no parallel row data to map against (a query
+-- whose SQL wasn't safe to re-run for it) or the arithmetic doesn't add up,
+-- signaling callers to fall back to the simple 1-line-per-row assumption.
+local function compute_row_blocks(state)
+  if not state.page_rows then
+    return nil
+  end
+  local layout = MODE_LAYOUT[config.display_mode]
+  if not layout then
+    return nil
+  end
+  local data_end = #state.view_lines - (layout.trailing_border and 1 or 0)
+  local blocks = {}
+  local idx = layout.data_start
+  for i, row in ipairs(state.page_rows) do
+    local max_nl = 0
+    for _, v in pairs(row) do
+      if type(v) == "string" then
+        local _, n = v:gsub("\n", "")
+        if n > max_nl then
+          max_nl = n
+        end
+      end
+    end
+    local span = 1 + max_nl
+    local view_end = idx + span - 1
+    if view_end > data_end then
+      return nil -- page_rows and view_lines disagree; don't guess
+    end
+    blocks[i] = { view_start = idx, view_end = view_end }
+    idx = view_end + 1
+    if idx <= data_end and is_row_separator(config.display_mode, state.view_lines[idx]) then
+      idx = idx + 1
+    end
+  end
+  return blocks
+end
+
 -- Resolve the SQL column name and cell text under the cursor, or nil if it
 -- isn't over a data cell (header/border line, an unresolvable query, an
 -- unrecognized display mode, empty view, …). Column names are read straight
 -- off the rendered header line — sqlite3 emits the same name there whether
 -- it came from `PRAGMA table_info` or a query's own column/alias — so this
--- works identically for the table view and query results.
+-- works identically for the table view and query results. The cell's value
+-- comes from the parallel JSON row when available (exact, and immune to a
+-- cursor landing on a wrapped cell's continuation line); otherwise it's
+-- sliced from the rendered line, which is only reliable when every row on
+-- the page is a single physical line.
 local function cell_at_cursor(state)
   local table_name = source_table(state)
   if not table_name then
@@ -500,22 +592,44 @@ local function cell_at_cursor(state)
   end
   local header_line = state.view_lines[layout.header]
   local sep_line = state.view_lines[layout.sep]
-  local line = state.view_lines[view_idx]
-  if not (header_line and sep_line and line) then
+  if not (header_line and sep_line) then
     return nil
   end
-  local char_col = vim.fn.charidx(line, cursor[2])
+  -- Column boundaries are fixed-width for every physical line of the page
+  -- (including a wrapped cell's continuation lines), so char_col is always
+  -- computed against the cursor's own line, not necessarily a row's first.
+  local cursor_line = state.view_lines[view_idx]
+  if not cursor_line then
+    return nil
+  end
+  local blocks = compute_row_blocks(state)
+  local row_idx
+  if blocks then
+    for i, block in ipairs(blocks) do
+      if view_idx >= block.view_start and view_idx <= block.view_end then
+        row_idx = i
+        break
+      end
+    end
+    if not row_idx then
+      return nil -- cursor landed on an interstitial separator line
+    end
+  end
+  local char_col = vim.fn.charidx(cursor_line, cursor[2])
   for _, r in ipairs(parse_column_ranges(sep_line)) do
     if char_col >= r[1] and char_col < r[2] then
       local col_name = vim.trim(vim.fn.strcharpart(header_line, r[1], r[2] - r[1]))
       if col_name == "" then
         return nil
       end
-      return {
-        table = table_name,
-        column = col_name,
-        value = vim.trim(vim.fn.strcharpart(line, r[1], r[2] - r[1])),
-      }
+      local value
+      if row_idx then
+        local raw = state.page_rows[row_idx][col_name]
+        value = (raw == nil or raw == vim.NIL) and "" or tostring(raw)
+      else
+        value = vim.trim(vim.fn.strcharpart(cursor_line, r[1], r[2] - r[1]))
+      end
+      return { table = table_name, column = col_name, value = value }
     end
   end
   return nil
@@ -527,7 +641,13 @@ end
 -- re-running the SQL could repeat a write statement's side effects).
 local function current_location_entry(state, cursor)
   if state.view_mode == "query" then
-    return { kind = "query", lines = vim.deepcopy(state.view_lines), query_table = state.query_table, cursor = cursor }
+    return {
+      kind = "query",
+      lines = vim.deepcopy(state.view_lines),
+      page_rows = state.page_rows and vim.deepcopy(state.page_rows) or nil,
+      query_table = state.query_table,
+      cursor = cursor,
+    }
   end
   return { kind = "table", table = state.current_table, offset = state.offset, cursor = cursor }
 end
@@ -669,9 +789,20 @@ local function goto_foreign_key(state)
 
   load_table(state, fk.table, page_offset)
 
-  local layout = MODE_LAYOUT[config.display_mode]
-  if win and layout then
-    pcall(api.nvim_win_set_cursor, win, { layout.data_start + row_in_page + 2, 0 })
+  if win then
+    -- row_in_page is a row index, not a view_lines index: a row before it
+    -- on the page may itself span more than one physical line (a wrapped
+    -- cell), so its buffer line has to come from compute_row_blocks, not
+    -- a fixed one-line-per-row offset from data_start.
+    local blocks = compute_row_blocks(state)
+    local view_start = blocks and blocks[row_in_page + 1] and blocks[row_in_page + 1].view_start
+    if not view_start then
+      local layout = MODE_LAYOUT[config.display_mode]
+      view_start = layout and (layout.data_start + row_in_page)
+    end
+    if view_start then
+      pcall(api.nvim_win_set_cursor, win, { view_start + 2, 0 })
+    end
   end
 end
 
@@ -684,6 +815,7 @@ local function restore_location(state, entry)
     state.view_mode = "query"
     state.query_table = entry.query_table
     state.view_lines = entry.lines
+    state.page_rows = entry.page_rows
     local lines = { "query results", "" }
     vim.list_extend(lines, entry.lines)
     set_lines(state.buf, lines)

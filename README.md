@@ -149,3 +149,8 @@ highlights or extra keymaps via a `FileType` autocmd.
   `page_size`, but a huge table's `count(*)` or an expensive query can
   briefly block.
 - Requires the `sqlite3` CLI — there are no libsqlite/FFI bindings.
+- `gd` correctly handles cells with embedded newlines (sqlite3 wraps those
+  onto extra physical lines) in the table view and in `SELECT` query
+  results. For a write statement's (INSERT/UPDATE/…) results specifically,
+  it falls back to assuming one line per row, since getting the same
+  precision there would mean re-running the write a second time.
