@@ -154,3 +154,13 @@ highlights or extra keymaps via a `FileType` autocmd.
   results. For a write statement's (INSERT/UPDATE/…) results specifically,
   it falls back to assuming one line per row, since getting the same
   precision there would mean re-running the write a second time.
+
+## Tests
+
+```sh
+nvim --headless -u NONE -l tests/db_test.lua
+```
+
+Runs the read-only database access against real databases made with the
+`sqlite3` CLI, including WAL databases nothing has open, which are read
+as immutable.

@@ -46,12 +46,14 @@ end
 
 local uv = vim.uv or vim.loop
 
--- Whether path is a WAL-mode database that nothing has open. sqlite3
--- -readonly can't open one: it needs the -shm file and may not create it.
--- But a connection in WAL mode always has a -shm, and closing the last one
--- checkpoints the WAL and removes both files, so with no -shm and no WAL
--- data the main file holds everything and can be read as immutable.
-local function closed_wal(path)
+-- Whether path is a WAL-mode database with no -wal file. sqlite3
+-- -readonly can't open one: a read-only connection may create the -shm but
+-- not the -wal. It also means nothing has the database open, since every
+-- connection in WAL mode keeps a -wal, and that closing the last one
+-- checkpointed everything into the main file and removed the -wal. So the
+-- main file can be read as immutable: without locks or sidecar files, and
+-- without creating any.
+local function unopened_wal(path)
   local f = io.open(path, "rb")
   if not f then
     return false
@@ -62,31 +64,31 @@ local function closed_wal(path)
   if not header or #header < 20 or header:sub(1, 15) ~= "SQLite format 3" or header:byte(19) ~= 2 then
     return false
   end
-  if uv.fs_stat(path .. "-shm") then
-    return false
-  end
-  local wal = uv.fs_stat(path .. "-wal")
-  return not wal or wal.size == 0
+  return uv.fs_stat(path .. "-wal") == nil
 end
 
--- A file: URI opening path as immutable: no locks and no -shm needed.
+-- A file: URI opening path as immutable. Characters URIs treat specially
+-- are escaped; Windows paths get forward slashes and a leading slash
+-- (file:///C:/...).
 local function immutable_uri(path)
-  local abs = vim.fn.fnamemodify(path, ":p")
+  local abs = vim.fn.fnamemodify(path, ":p"):gsub("\\", "/")
+  if abs:sub(1, 1) ~= "/" then
+    abs = "/" .. abs
+  end
   local enc = abs:gsub("%%", "%%25"):gsub("%?", "%%3F"):gsub("#", "%%23")
-  return "file:" .. enc .. "?immutable=1"
+  return "file://" .. enc .. "?immutable=1"
 end
 
--- Run a read-only sqlite3 call: flags, then the database, then sql. If it
--- can't open a WAL database that nothing has open (see closed_wal), retry
--- reading it as immutable.
+-- Run a read-only sqlite3 call: flags, then the database, then sql. A WAL
+-- database with no -wal (see unopened_wal) is read as immutable, since
+-- sqlite3 -readonly can't open it.
 local function run_readonly(flags, path, sql)
-  local args = vim.list_extend(vim.deepcopy(flags), { path, sql })
-  local res = run(args)
-  if res.ok or not closed_wal(path) then
-    return res
-  end
-  return run(vim.list_extend(vim.deepcopy(flags), { immutable_uri(path), sql }))
+  local target = unopened_wal(path) and immutable_uri(path) or path
+  return run(vim.list_extend(vim.deepcopy(flags), { target, sql }))
 end
+
+-- Exposed for tests only.
+M._immutable_uri = immutable_uri
 
 -- JSON metadata query (read-only). Used where the plugin needs values, not
 -- display text: table names, row counts, column metadata.
