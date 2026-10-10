@@ -44,10 +44,54 @@ local function run(args)
   return { ok = true, stdout = out }
 end
 
+local uv = vim.uv or vim.loop
+
+-- Whether path is a WAL-mode database that nothing has open. sqlite3
+-- -readonly can't open one: it needs the -shm file and may not create it.
+-- But a connection in WAL mode always has a -shm, and closing the last one
+-- checkpoints the WAL and removes both files, so with no -shm and no WAL
+-- data the main file holds everything and can be read as immutable.
+local function closed_wal(path)
+  local f = io.open(path, "rb")
+  if not f then
+    return false
+  end
+  local header = f:read(20)
+  f:close()
+  -- Bytes 18 and 19 (1-based 19 and 20) are 2 in WAL mode.
+  if not header or #header < 20 or header:sub(1, 15) ~= "SQLite format 3" or header:byte(19) ~= 2 then
+    return false
+  end
+  if uv.fs_stat(path .. "-shm") then
+    return false
+  end
+  local wal = uv.fs_stat(path .. "-wal")
+  return not wal or wal.size == 0
+end
+
+-- A file: URI opening path as immutable: no locks and no -shm needed.
+local function immutable_uri(path)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local enc = abs:gsub("%%", "%%25"):gsub("%?", "%%3F"):gsub("#", "%%23")
+  return "file:" .. enc .. "?immutable=1"
+end
+
+-- Run a read-only sqlite3 call: flags, then the database, then sql. If it
+-- can't open a WAL database that nothing has open (see closed_wal), retry
+-- reading it as immutable.
+local function run_readonly(flags, path, sql)
+  local args = vim.list_extend(vim.deepcopy(flags), { path, sql })
+  local res = run(args)
+  if res.ok or not closed_wal(path) then
+    return res
+  end
+  return run(vim.list_extend(vim.deepcopy(flags), { immutable_uri(path), sql }))
+end
+
 -- JSON metadata query (read-only). Used where the plugin needs values, not
 -- display text: table names, row counts, column metadata.
 local function query(path, sql)
-  local res = run({ "-readonly", "-json", path, sql })
+  local res = run_readonly({ "-readonly", "-json" }, path, sql)
   if not res.ok then
     return res
   end
@@ -70,16 +114,15 @@ end
 ---@param opts { readonly: boolean }|nil
 function M.raw(path, sql, opts)
   opts = opts or {}
-  local args = {}
-  if opts.readonly ~= false then
-    args[#args + 1] = "-readonly"
-  end
   -- box/table/markdown imply headers, but plain modes (column, list, …) don't
-  args[#args + 1] = "-header"
-  args[#args + 1] = "-" .. (config.display_mode or "box")
-  args[#args + 1] = path
-  args[#args + 1] = sql
-  local res = run(args)
+  local flags = { "-header", "-" .. (config.display_mode or "box") }
+  local res
+  if opts.readonly ~= false then
+    table.insert(flags, 1, "-readonly")
+    res = run_readonly(flags, path, sql)
+  else
+    res = run(vim.list_extend(flags, { path, sql }))
+  end
   if not res.ok then
     return res
   end
